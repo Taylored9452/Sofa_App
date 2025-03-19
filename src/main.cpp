@@ -27,8 +27,8 @@ bool deviceConnected = false;
 unsigned long lastDHTReadTime = 0;
 const long DHTReadInterval = 2000;
 
-#define TEMP_THRESHOLD 60.0
-#define MQ2_THRESHOLD 2000
+#define TEMP_THRESHOLD 60.0  //กำหนดค่า 60 temp
+#define MQ2_THRESHOLD 2000   //กำหนดค่า 2000 ppm
 #define SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
 #define CHARACTERISTIC_UUID "abcd1234-5678-1234-5678-abcdef123456"
 #define SENSOR_CHARACTERISTIC_UUID "1234abcd-5678-1234-5678-abcdef654321"
