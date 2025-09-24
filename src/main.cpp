@@ -8,7 +8,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// ----------------- ขา -----------------
+// ----------------- ขา ------------------
 const int RELAY1_PIN = 18; // รีเลย์ท่านั่ง
 const int RELAY2_PIN = 19; // รีเลย์ท่านอน
 #define DHTPIN 16
