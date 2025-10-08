@@ -16,7 +16,7 @@ const int RELAY2_PIN = 19;
 #define MQ2PIN 34
 #define BUZZER_PIN 17
 #define BUZZER_CHANNEL 0
-#define FORCE_SENSOR_PIN 32     // ขา analog สำหรับ force sensor
+#define FORCE_SENSOR_PIN 32     
 
 // ---------- Force sensor + Deep Sleep ----------
 #define SLEEP_THRESHOLD 2500     // ค่า ADC ต่ำกว่าถือว่าไม่มีคนนั่ง
