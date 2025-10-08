@@ -7,14 +7,22 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_sleep.h"
 
 // ----------------- ขา ------------------
-const int RELAY1_PIN = 18; // รีเลย์ท่านั่ง
-const int RELAY2_PIN = 19; // รีเลย์ท่านอน
+const int RELAY1_PIN = 18;
+const int RELAY2_PIN = 19;
 #define DHTPIN 16
 #define MQ2PIN 34
 #define BUZZER_PIN 17
 #define BUZZER_CHANNEL 0
+#define FORCE_SENSOR_PIN 32     // ขา analog สำหรับ force sensor
+
+// ---------- Force sensor + Deep Sleep ----------
+#define SLEEP_THRESHOLD 2500     // ค่า ADC ต่ำกว่าถือว่าไม่มีคนนั่ง
+#define SLEEP_HYSTERESIS 500
+#define DEEP_SLEEP_DELAY 15000    // ms
+unsigned long lastBelowThreshold = 0;
 
 // ---------- MPU6050 ----------
 TwoWire I2C_1 = TwoWire(0);
@@ -43,6 +51,7 @@ BLEServer *pServer = NULL;
 BLECharacteristic *cmdCharacteristic;
 BLECharacteristic *sensorCharacteristic;
 bool deviceConnected = false;
+String currentClientAddress = "";
 
 // ---------- Sensor ----------
 SimpleDHT22 dht22;
@@ -63,15 +72,15 @@ const long toneToggleInterval = 200;
 // ---------- Debounce ----------
 unsigned long lastAutoCommandTime = 0;
 unsigned long lastSaveCommandTime = 0;
-const unsigned long commandDebounce = 2500; // ms
+const unsigned long commandDebounce = 2500;
 
 // ---------- Function Sit and Lie ----------
 unsigned long sitStartTime = 0;
 unsigned long lieStartTime = 0;
 bool sitActive = false;
 bool lieActive = false;
-bool sitLieLock = false;  // ล็อกเมื่อ Sit/Lie ทำงาน
-const unsigned long relayDuration = 12000; // 12 วินาที
+bool sitLieLock = false;
+const unsigned long relayDuration = 12000;
 
 // ---------- Presets ----------
 const int NUM_PRESETS = 3;
@@ -87,20 +96,35 @@ void buzzerControl();
 void checkRelayTimer(unsigned long now);
 void setupBLE();
 void sendStatus(String status);
+void checkForceSensorAndSleep();   // Deep sleep
 
 // ---------- BLE Callbacks ----------
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) { 
-    deviceConnected = true; 
-    Serial.println("BLE: connected"); 
+  void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
+    deviceConnected = true;
+    char address[18];
+    sprintf(address, "%02X:%02X:%02X:%02X:%02X:%02X",
+      param->connect.remote_bda[0],
+      param->connect.remote_bda[1],
+      param->connect.remote_bda[2],
+      param->connect.remote_bda[3],
+      param->connect.remote_bda[4],
+      param->connect.remote_bda[5]
+    );
+    currentClientAddress = String(address);
+    Serial.print("📱 BLE Connected from: ");
+    Serial.println(currentClientAddress);
   }
-  void onDisconnect(BLEServer* pServer) { 
-    deviceConnected = false; 
-    Serial.println("BLE: disconnected"); 
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("📴 BLE disconnected");
+    currentClientAddress = "";
     pServer->startAdvertising();
   }
 };
 
+// ---------- BLE Command ----------
 class CommandCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     std::string value = pCharacteristic->getValue();
@@ -110,13 +134,12 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
 
     unsigned long now = millis();
 
-    // ---------------- ป้องกันคำสั่งอื่นระหว่าง Sit/Lie ----------------
     if (sitLieLock && command != "Sit" && command != "Lie") {
       sendStatus("อยู่ระหว่างปรับโซฟา");
       return;
     }
 
-    // ---------------- AUTO / LOAD พรีเซต ----------------
+    // ---------------- AUTO / LOAD ----------------
     if (command.startsWith("AUTO")) {
       int slot = 1;
       if (command.length() > 4) slot = command[4] - '0';
@@ -146,7 +169,7 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    // ---------------- SAVE พรีเซต ----------------
+    // ---------------- SAVE ----------------
     if (command.startsWith("SAVE")) {
       int slot = 1;
       if (command.length() > 4) slot = command[4] - '0';
@@ -224,9 +247,18 @@ void setupBLE() {
   Serial.println("BLE พร้อม - กำลังโฆษณา");
 }
 
-// ---------- ฟังก์ชัน Preset ----------
+// 🔹 hash BLE address
+String hashAddress(String addr) {
+  uint32_t hash = 0;
+  for (int i = 0; i < addr.length(); i++) hash = (hash*31) + addr[i];
+  return String(hash, HEX);
+}
+
+// ---------- Preset ----------
 void savePosition(int slot) {
   if (slot < 1 || slot > NUM_PRESETS) return;
+  if (currentClientAddress == "") currentClientAddress = "unknown";
+  String addrKey = hashAddress(currentClientAddress);
 
   mpu1.update(); mpu2.update();
   targetRoll1 = atan2(-mpu1.getAccX(), mpu1.getAccZ())*180/PI;
@@ -235,40 +267,31 @@ void savePosition(int slot) {
   hasTarget = true;
 
   prefs.begin("sofa", false);
-  prefs.putFloat(("roll1_" + String(slot)).c_str(), targetRoll1);
-  prefs.putFloat(("roll2_" + String(slot)).c_str(), targetRoll2);
-  prefs.putFloat(("ofs1x_" + String(slot)).c_str(), mpu1.getAccXoffset());
-  prefs.putFloat(("ofs1y_" + String(slot)).c_str(), mpu1.getAccYoffset());
-  prefs.putFloat(("ofs1z_" + String(slot)).c_str(), mpu1.getAccZoffset());
-  prefs.putFloat(("ofs2x_" + String(slot)).c_str(), mpu2.getAccXoffset());
-  prefs.putFloat(("ofs2y_" + String(slot)).c_str(), mpu2.getAccYoffset());
-  prefs.putFloat(("ofs2z_" + String(slot)).c_str(), mpu2.getAccZoffset());
+  String prefix = addrKey + "_";
+  prefs.putFloat((prefix + "r1_" + slot).c_str(), targetRoll1);
+  prefs.putFloat((prefix + "r2_" + slot).c_str(), targetRoll2);
   prefs.end();
 
-  Serial.printf("บันทึกพรีเซต %d >> Roll1=%.2f | Roll2=%.2f\n", slot, targetRoll1, targetRoll2);
+  Serial.printf("บันทึกพรีเซต %d สำหรับ [%s] (key:%s) >> Roll1=%.2f | Roll2=%.2f\n",
+                slot, currentClientAddress.c_str(), addrKey.c_str(), targetRoll1, targetRoll2);
 }
 
 bool loadPosition(int slot) {
   if (slot < 1 || slot > NUM_PRESETS) return false;
+  if (currentClientAddress == "") currentClientAddress = "unknown";
+  String addrKey = hashAddress(currentClientAddress);
 
   prefs.begin("sofa", false);
-  targetRoll1 = prefs.getFloat(("roll1_" + String(slot)).c_str(), 0);
-  targetRoll2 = prefs.getFloat(("roll2_" + String(slot)).c_str(), 0);
-  mpu1.setAccOffsets(
-    prefs.getFloat(("ofs1x_" + String(slot)).c_str(), 0),
-    prefs.getFloat(("ofs1y_" + String(slot)).c_str(), 0),
-    prefs.getFloat(("ofs1z_" + String(slot)).c_str(), 0)
-  );
-  mpu2.setAccOffsets(
-    prefs.getFloat(("ofs2x_" + String(slot)).c_str(), 0),
-    prefs.getFloat(("ofs2y_" + String(slot)).c_str(), 0),
-    prefs.getFloat(("ofs2z_" + String(slot)).c_str(), 0)
-  );
+  String prefix = addrKey + "_";
+  targetRoll1 = prefs.getFloat((prefix + "r1_" + slot).c_str(), 0);
+  targetRoll2 = prefs.getFloat((prefix + "r2_" + slot).c_str(), 0);
   prefs.end();
 
   hasTarget = true;
-  Serial.printf("โหลดพรีเซต %d >> Roll1=%.2f | Roll2=%.2f\n", slot, targetRoll1, targetRoll2);
-  return true;
+  Serial.printf("โหลดพรีเซต %d สำหรับ [%s] (key:%s) >> Roll1=%.2f | Roll2=%.2f\n",
+                slot, currentClientAddress.c_str(), addrKey.c_str(), targetRoll1, targetRoll2);
+
+  return (targetRoll1 != 0 || targetRoll2 != 0);
 }
 
 // ---------- MPU ----------
@@ -292,13 +315,11 @@ void checkMPU() {
 
 void autoControl(unsigned long now) {
   if (!autoActive || !mpuAvailable) return;
-
   if (now - lastMPUReadTime >= mpuReadInterval) {
     lastMPUReadTime = now;
     mpu1.update(); delay(5); mpu2.update();
     lastRoll1 = atan2(-mpu1.getAccX(), mpu1.getAccZ())*180/PI;
     lastRoll2 = atan2(-mpu2.getAccX(), mpu2.getAccZ())*180/PI;
-
     handleRelaySwitch(now);
   }
 }
@@ -307,9 +328,6 @@ void handleRelaySwitch(unsigned long now) {
   const float tolerance = 5.0, hysteresis = 3.0;
   const unsigned long switchDelay = 1000;
   float weightedError = (targetRoll1 - lastRoll1)*0.7 + (targetRoll2 - lastRoll2)*0.3;
-
-  Serial.printf("Auto debug >> weightedError=%.2f | currentPosition=%d | switchState=%d\n",
-                weightedError, currentPosition, switchState);
 
   switch (switchState) {
     case IDLE:
@@ -328,7 +346,6 @@ void handleRelaySwitch(unsigned long now) {
         sendStatus("Auto Mode: ถึงตำแหน่งแล้ว!");
       }
       break;
-
     case SWITCH_WAIT:
       if (now - lastSwitchTime >= switchDelay) {
         if (currentPosition == SITTING) {
@@ -373,25 +390,16 @@ void readSensors() {
   }
 
   int mq2Val = analogRead(MQ2PIN);
-
-  // ส่งค่าเป็น comma-separated เพื่อ Flutter แยกแสดงใน _infoCard
   String sensorMsg = String((int)temperature) + "," + String((int)humidity) + "," + String(mq2Val);
   sendStatus(sensorMsg);
 
-  // เตือน
-  if (temperature > TEMP_THRESHOLD || mq2Val > MQ2_THRESHOLD) {
-    toggleTone = true;
-  } else {
-    toggleTone = false;
-    toneState = false;
-    ledcWrite(BUZZER_CHANNEL, 0);
-  }
+  if (temperature > TEMP_THRESHOLD || mq2Val > MQ2_THRESHOLD) toggleTone = true;
+  else { toggleTone = false; toneState = false; ledcWrite(BUZZER_CHANNEL, 0); }
 }
 
 // ---------- Buzzer ----------
 void buzzerControl() {
   if (!toggleTone) return;
-
   unsigned long now = millis();
   if (now - lastToneToggleTime >= toneToggleInterval) {
     lastToneToggleTime = now;
@@ -400,21 +408,34 @@ void buzzerControl() {
   }
 }
 
+// ---------- Force sensor + deep sleep ----------
+void checkForceSensorAndSleep() {
+  int val = analogRead(FORCE_SENSOR_PIN);
+
+  if(val < SLEEP_HYSTERESIS) {
+    if(lastBelowThreshold == 0) lastBelowThreshold = millis();
+    else if(millis() - lastBelowThreshold >= DEEP_SLEEP_DELAY) {
+      Serial.println("ไม่มีคนนั่ง → Deep Sleep");
+      esp_sleep_enable_ext0_wakeup((gpio_num_t)FORCE_SENSOR_PIN, 1);
+      esp_deep_sleep_start();
+    }
+  } else lastBelowThreshold = 0;
+}
+
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   ledcSetup(BUZZER_CHANNEL, 2000, 8);
   ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
+  pinMode(FORCE_SENSOR_PIN, INPUT);
 
   I2C_1.begin(21, 22);
   I2C_2.begin(25, 26);
 
   checkMPU();
-
   setupBLE();
 }
 
@@ -424,6 +445,7 @@ void loop() {
   checkMPU();
   autoControl(now);
   checkRelayTimer(now);
+  checkForceSensorAndSleep();  // ตรวจจับคนนั่ง → deep sleep
   readSensors();
   buzzerControl();
 }
